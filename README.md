@@ -1,7 +1,14 @@
-nodredis
-========
+"nodredis"
+==========
 
 Node Redis client, really simple and small
+
+How to Install
+==============
+
+```sh
+npm install nodredis
+```
 
 How to Use
 ==========
