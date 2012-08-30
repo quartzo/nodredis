@@ -8,9 +8,11 @@ function connect(port, host, options) {
         function() { //'connect' listener
             self.connected = true;
             self.emit('connect');
+            self._keep_alive();
         }
     );
     this.cl.on('error', function(err) {
+        self.connected = false;
         while(self._callbacks.length) {
             var cb = self._callbacks.shift().cb;
             if(cb) cb(err);
@@ -33,6 +35,7 @@ function connect(port, host, options) {
         };
     });
     this.cl.on('end', function() {
+        self.connected = false;
         while(self._callbacks.length) {
             var cb = self._callbacks.shift().cb;
             if(cb) cb(new Error('redis connection destroyed'));
@@ -144,6 +147,15 @@ connect.prototype.req_cmd = function(params, cb, binaryresp) {
     bufs.push(new Buffer(strs.join('')));
     this.cl.write(Buffer.concat(bufs));
     this._callbacks.push({cb:cb, bin:binaryresp});
+}
+
+connect.prototype._keep_alive = function() {
+    var self = this;
+    if(!this.connected) return;
+    this.req_cmd(['ping'], null, false);
+    setTimeout(function () {
+        self._keep_alive();
+    }, 180000);
 }
 
 connect.prototype.cmd = function() {

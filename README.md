@@ -39,7 +39,7 @@ cl.cmd('get', 'test', console.log);
 Binary Data
 -----------
 ```javascript
-cl.cmdbin('set', 'test', Buffer('c0c1c2c3c400010203', 'bin'));
+cl.cmdbin('set', 'test', Buffer('c0c1c2c3c400010203', 'hex'));
 cl.cmdbin('get', 'test', console.log);
 ```
 
