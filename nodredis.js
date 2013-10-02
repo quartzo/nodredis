@@ -13,6 +13,7 @@ function connect(port, host, options) {
     );
     this.cl.on('error', function(err) {
         self.connected = false;
+        self.ended = true;
         while(self._callbacks.length) {
             var cb = self._callbacks.shift().cb;
             if(cb) cb(err);
@@ -20,6 +21,7 @@ function connect(port, host, options) {
         self.emit('end', err);
     });
     this.connected = false;
+    this.ended = false;
     this._bufbytes = new Buffer(0);
     this._bufelements = [];
     this._callbacks = [];
@@ -27,8 +29,8 @@ function connect(port, host, options) {
         self._consume_bytes(data);
         while(self._has_element()) {
             var dadcb = self._callbacks.shift();
-            var cb = dadcb.cb;
-            var el = self._get_element(dadcb.bin);
+            var cb = dadcb && dadcb.cb;
+            var el = self._get_element(dadcb && dadcb.bin);
             if(!cb) continue;
             if(el[0] == 'e') cb(el[1]);
             else cb(null, el[1]);
@@ -36,6 +38,7 @@ function connect(port, host, options) {
     });
     this.cl.on('end', function() {
         self.connected = false;
+        self.ended = true;
         while(self._callbacks.length) {
             var cb = self._callbacks.shift().cb;
             if(cb) cb(new Error('redis connection destroyed'));
@@ -130,6 +133,10 @@ connect.prototype._get_element = function(binary_resp) {
 var crlf = '\r\n';
 
 connect.prototype.req_cmd = function(params, cb, binaryresp) {
+    if(this.ended) {
+        if(cb) return cb(new Error('redis connection closed'));
+        return;
+    }
     var bufs = [];
     var strs = [ '*'+params.length+crlf ];
     for(var i=0; i<params.length; i++) {
@@ -151,7 +158,7 @@ connect.prototype.req_cmd = function(params, cb, binaryresp) {
 
 connect.prototype._keep_alive = function() {
     var self = this;
-    if(!this.connected) return;
+    if((!this.connected) || this.ended) return;
     this.req_cmd(['ping'], null, false);
     setTimeout(function () {
         self._keep_alive();
@@ -173,6 +180,7 @@ connect.prototype.cmdbin = function() {
 }
 
 connect.prototype.end = function () {
+    this.ended = true;
     this.cl.end();
 };
 
