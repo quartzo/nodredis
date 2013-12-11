@@ -2,7 +2,14 @@ var events = require('events');
 var util = require('util');
 var net = require('net');
 
-function connect(port, host, options) {
+function connect(arg0, arg1) {
+    var host, port;
+    if(/^[0-9]+$/.test(arg0+"")) { // port and host
+        host = arg1; port = arg0; 
+    } else { // string 'host:port'
+        var hostport = ((arg0||"")+"").split(':');
+        host = hostport[0]; port = hostport[1];
+    }
     var self = this;
     this.cl = net.connect(port || 6379, host || 'localhost',
         function() { //'connect' listener
@@ -194,7 +201,40 @@ connect.prototype.destroy = function (fire_callbacks) {
     }
 };
 
+function get_master_from_sentinel(master, sentinels, cb) {
+    if(!Array.isArray(sentinels)) 
+        sentinels = [sentinels];
+    function next() {
+        var sentinel = sentinels.shift();
+        if(sentinel == undefined)
+            return cb();
+        var sentinelsep = ((sentinel||'')+'').split(':');
+        var host = sentinelsep[0] || "127.0.0.1";
+        var port = sentinelsep[1] || 26379;
+        var cl = new connect(host+":"+port);
+        var tmout = setTimeout(function() {
+            cl.destroy();
+            next();
+        }, 5000);
+        cl.on("end",function () {
+            clearTimeout(tmout);
+            next();
+        });
+        cl.on("connect", function () {
+            clearTimeout(tmout);
+            cl.cmd('sentinel', 'get-master-addr-by-name', 
+                    master, function(err, hostport) {
+                if(Array.isArray(hostport))
+                    return cb(hostport[0]+":"+hostport[1]);
+                return cb();
+            });
+        });
+    }
+    next();
+}
+
 module.exports = {
-    connect: connect
+    connect: connect,
+    get_master_from_sentinel: get_master_from_sentinel
 };
 
