@@ -3,19 +3,44 @@ var util = require('util');
 var net = require('net');
 
 function connect(arg0, arg1) {
-    var host, port;
+    this.connected = false;
+    this.ended = false;
+    this.tosend = [];
+    this._callbacks = [];
     if(/^[0-9]+$/.test(arg0+"")) { // port and host
-        host = arg1; port = arg0; 
-    } else { // string 'host:port'
-        var hostport = ((arg0||"")+"").split(':');
-        host = hostport[0]; port = hostport[1];
+        var host = arg1; 
+        var port = arg0; 
+        this._connect_redis(host, port);
+        return;
     }
+    // string 'host:port' or '[mymaster]host:port,host2:port2
+    arg0 = ((arg0||"")+"");
+    if(arg0[0] != '[') {
+        var hostport = arg0.split(':');
+        var host = hostport[0]; 
+        var port = hostport[1];
+        this._connect_redis(host, port);
+        return;
+    }
+    var mhp = arg0.split(']');
+    this._master = mhp[0].substr(1);
+    this._sentinels = (mhp[1] || '').split(',');
+    this._connect_sentinel();
+}
+
+util.inherits(connect, events.EventEmitter);
+
+connect.prototype._connect_redis = function(host, port) {
     var self = this;
     this.cl = net.connect(port || 6379, host || 'localhost',
         function() { //'connect' listener
-            self.connected = true;
-            self.emit('connect');
-            self._keep_alive();
+            self.cl.write(Buffer.concat(self.tosend));
+            self.tosend = [];
+            if(!self.ended) {
+                self.connected = true;
+                self.emit('connect');
+                self._keep_alive();
+            }
         }
     );
     this.cl.on('error', function(err) {
@@ -27,17 +52,15 @@ function connect(arg0, arg1) {
         }
         self.emit('end', err);
     });
-    this.connected = false;
-    this.ended = false;
-    this._bufbytes = new Buffer(0);
-    this._bufelements = [];
-    this._callbacks = [];
+    var bufbytes = new Buffer(0);
+    var bufelements = [];
     this.cl.on('data', function(data) {
-        self._consume_bytes(data);
-        while(self._has_element()) {
+        bufbytes = Buffer.concat([bufbytes, data]);
+        parse_elements(bufelements, bufbytes);
+        while(has_one_complete_element(bufelements)) {
             var dadcb = self._callbacks.shift();
             var cb = dadcb && dadcb.cb;
-            var el = self._get_element(dadcb && dadcb.bin);
+            var el = get_complete_element(bufelements, dadcb && dadcb.bin);
             if(!cb) continue;
             if(el[0] == 'e') cb(el[1]);
             else cb(null, el[1]);
@@ -54,66 +77,122 @@ function connect(arg0, arg1) {
     });
 }
 
-util.inherits(connect, events.EventEmitter);
+connect.prototype._connect_sentinel = function() {
+    var self = this;
+    var sentinel = self._sentinels.shift();
+    if(sentinel == undefined) {
+        self.ended = true;
+        var err = new Error("can't find sentinel");
+        while(self._callbacks.length) {
+            var cb = self._callbacks.shift().cb;
+            if(cb) cb(err);
+        }
+        self.emit('end', err);
+        return;
+    }
+    var sentinelsep = sentinel.split(':');
+    var host = sentinelsep[0] || "localhost";
+    var port = sentinelsep[1] || 26379;
+    var cl;
+    var tmout = setTimeout(function() {
+        cl.destroy();
+        self._connect_sentinel();
+    }, 5000);
+    cl = net.connect(port, host,
+        function() { //'connect' listener
+            clearTimeout(tmout);
+            cl.write(serialize(['sentinel', 'get-master-addr-by-name', 
+                    self._master]));
+        }
+    );
+    cl.on('error', function(err) {
+        clearTimeout(tmout);
+        self._connect_sentinel();
+    });
+    cl.on('end', function() {
+        clearTimeout(tmout);
+        self._connect_sentinel();
+    });
+    var bufbytes = new Buffer(0);
+    var bufelements = [];
+    cl.on('data', function(data) {
+        bufbytes = Buffer.concat([bufbytes, data]);
+        parse_elements(bufelements, bufbytes);
+        if(has_one_complete_element(bufelements)) {
+            cl.destroy();
+            var el = get_complete_element(bufelements, false);
+            if(!Array.isArray(el[1])) {
+                self._connect_sentinel();
+                return;
+            }
+            var host = el[1][0], port = el[1][1];
+            self._connect_redis(host, port);
+        };
+    });
+}
 
-connect.prototype._consume_bytes = function(data) {
-    this._bufbytes = Buffer.concat([this._bufbytes, data]);
+function parse_one_element(buf) {
+    var p, el;
+    var tp = String.fromCharCode(buf[0]);
+    for(p = 0;; p++) {
+        if(p >= buf.length) return; // need more data
+        if(buf[p] == 10) break; // is \n
+    }
+    var dadp = p;
+    if(buf[dadp-1] == 13) dadp--; // is \r
+    p++;
+    var dad = buf.slice(1, dadp);
+    switch(tp) {
+        case '-':
+            el = ['e',
+                new Error('error: -'+dad.toString('utf8'))];
+            break;
+        case '+':
+            el = ['d', dad];
+            break;
+        case '$':
+            var sz = parseInt(dad.toString('utf8'));
+            if(sz <= -1) {
+                el = ['d',null];
+            } else {
+                if(buf.length < p+sz+2)
+                    return; // need more data
+                el = ['d',buf.slice(p,p+sz)];
+                p += sz+2;
+            }
+            break;
+        case '*':
+            var sz = parseInt(dad.toString('utf8'));
+            if(sz <= '-1') {
+                el = ['d',null];
+            } else {
+                el = ['l',sz];
+            };
+            break;
+        case ':':
+            var num = parseInt(dad.toString('utf8'));
+            el = ['d', num]; // integer
+            break;
+        default:
+            throw(new Error('redis protocol problems'));
+    }
+    return [el, buf.slice(p)];
+}
+
+function parse_elements(bufelems, bufbytes) {
     for(;;) {
-        var buf = this._bufbytes;
-        var p;
-        var tp = String.fromCharCode(buf[0]);
-        for(p = 0;; p++) {
-            if(p >= buf.length) return; // need more data
-            if(buf[p] == 10) break; // is \n
-        }
-        var dadp = p;
-        if(buf[dadp-1] == 13) dadp--; // is \r
-        p++;
-        var dad = buf.slice(1, dadp);
-        switch(tp) {
-            case '-':
-                this._bufelements.push(['e',
-                    new Error('error: -'+dad.toString('utf8'))]);
-                break;
-            case '+':
-                this._bufelements.push(['d', dad]);
-                break;
-            case '$':
-                var sz = parseInt(dad.toString('utf8'));
-                if(sz <= -1) {
-                    this._bufelements.push(['d',null]);
-                } else {
-                    if(buf.length < p+sz+2)
-                        return; // need more data
-                    this._bufelements.push(['d',buf.slice(p,p+sz)]);
-                    p += sz+2;
-                }
-                break;
-            case '*':
-                var sz = parseInt(dad.toString('utf8'));
-                if(sz <= '-1') {
-                    this._bufelements.push(['d',null]);
-                } else {
-                    this._bufelements.push(['l',sz]);
-                };
-                break;
-            case ':':
-                var num = parseInt(dad.toString('utf8'));
-                this._bufelements.push(['d', num]); // integer
-                break;
-            default:
-                throw(new Error('redis protocol problems'));
-                this.end();
-        }
-        this._bufbytes = buf.slice(p);
+        var elb = parse_one_element(bufbytes);
+        if(!elb) break;
+        bufelems.push(elb[0]);
+        bufbytes = elb[1];
     }
 }
 
-connect.prototype._has_element = function() {
+function has_one_complete_element(bufelements) {
     // check if there are enough elements
     var needed = 1, pos = 0;
     while(needed) {
-        var el = this._bufelements[pos++];
+        var el = bufelements[pos++];
         if(!el) return false;
         needed--;
         if(el[0] == 'l') needed += el[1];
@@ -121,8 +200,8 @@ connect.prototype._has_element = function() {
     return true;
 }
 
-connect.prototype._get_element = function(binary_resp) {
-    var el = this._bufelements.shift();
+function get_complete_element(bufelements, binary_resp) {
+    var el = bufelements.shift();
     if(el[0] != 'l') {
         if(!binary_resp && Buffer.isBuffer(el[1]))
             el[1] = el[1].toString('utf8');
@@ -131,7 +210,7 @@ connect.prototype._get_element = function(binary_resp) {
     var qtd = el[1];
     var resp = [];
     for(; qtd > 0; qtd--) {
-        el = this._get_element(binary_resp);
+        el = get_complete_element(bufelements, binary_resp);
         resp.push(el[1]);
     }
     return ['d', resp];
@@ -139,15 +218,11 @@ connect.prototype._get_element = function(binary_resp) {
 
 var crlf = '\r\n';
 
-connect.prototype.req_cmd = function(params, cb, binaryresp) {
-    if(this.ended) {
-        if(cb) return cb(new Error('redis connection closed'));
-        return;
-    }
+function serialize(elems) {
     var bufs = [];
-    var strs = [ '*'+params.length+crlf ];
-    for(var i=0; i<params.length; i++) {
-        var el = params[i];
+    var strs = [ '*'+elems.length+crlf ];
+    for(var i=0; i<elems.length; i++) {
+        var el = elems[i];
         if(Buffer.isBuffer(el)) {
             strs.push('$'+el.length+crlf);
             bufs.push(new Buffer(strs.join('')));
@@ -159,7 +234,19 @@ connect.prototype.req_cmd = function(params, cb, binaryresp) {
         }
     };
     bufs.push(new Buffer(strs.join('')));
-    this.cl.write(Buffer.concat(bufs));
+    return Buffer.concat(bufs);
+}
+
+connect.prototype.req_cmd = function(params, cb, binaryresp) {
+    if(this.ended) {
+        if(cb) return cb(new Error('redis connection closed'));
+        return;
+    }
+    var buf = serialize(params);
+    if(this.connected)
+        this.cl.write(buf);
+    else
+        this.tosend.push(buf);
     this._callbacks.push({cb:cb, bin:binaryresp});
 }
 
@@ -187,8 +274,10 @@ connect.prototype.cmdbin = function() {
 }
 
 connect.prototype.end = function () {
+    if(this.connected) 
+        this.cl.end();
     this.ended = true;
-    this.cl.end();
+    this.connected = false;
 };
 
 connect.prototype.destroy = function (fire_callbacks) {
@@ -201,40 +290,7 @@ connect.prototype.destroy = function (fire_callbacks) {
     }
 };
 
-function get_master_from_sentinel(master, sentinels, cb) {
-    if(!Array.isArray(sentinels)) 
-        sentinels = [sentinels];
-    function next() {
-        var sentinel = sentinels.shift();
-        if(sentinel == undefined)
-            return cb();
-        var sentinelsep = ((sentinel||'')+'').split(':');
-        var host = sentinelsep[0] || "127.0.0.1";
-        var port = sentinelsep[1] || 26379;
-        var cl = new connect(host+":"+port);
-        var tmout = setTimeout(function() {
-            cl.destroy();
-            next();
-        }, 5000);
-        cl.on("end",function () {
-            clearTimeout(tmout);
-            next();
-        });
-        cl.on("connect", function () {
-            clearTimeout(tmout);
-            cl.cmd('sentinel', 'get-master-addr-by-name', 
-                    master, function(err, hostport) {
-                if(Array.isArray(hostport))
-                    return cb(hostport[0]+":"+hostport[1]);
-                return cb();
-            });
-        });
-    }
-    next();
-}
-
 module.exports = {
-    connect: connect,
-    get_master_from_sentinel: get_master_from_sentinel
+    connect: connect
 };
 
