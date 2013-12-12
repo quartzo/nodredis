@@ -32,18 +32,7 @@ util.inherits(connect, events.EventEmitter);
 
 connect.prototype._connect_redis = function(host, port) {
     var self = this;
-    this.cl = net.connect(port || 6379, host || 'localhost',
-        function() { //'connect' listener
-            self.cl.write(Buffer.concat(self.tosend));
-            self.tosend = [];
-            if(!self.ended) {
-                self.connected = true;
-                self.emit('connect');
-                self._keep_alive();
-            }
-        }
-    );
-    this.cl.on('error', function(err) {
+    function finish(err) {
         self.connected = false;
         self.ended = true;
         while(self._callbacks.length) {
@@ -51,6 +40,32 @@ connect.prototype._connect_redis = function(host, port) {
             if(cb) cb(err);
         }
         self.emit('end', err);
+    }
+    var tmout = setTimeout(function() {
+        self.cl.destroy();
+        finish(new Error('redis connection TIMEDOUT'));
+    }, 15000);
+    this.cl = net.connect(port || 6379, host || 'localhost',
+        function() { //'connect' listener
+            clearTimeout(tmout);
+            self.cl.write(Buffer.concat(self.tosend));
+            self.tosend = [];
+            if(self.ended) {
+                self.cl.end();
+                return;
+            }
+            self.connected = true;
+            self.emit('connect');
+            self._keep_alive();
+        }
+    );
+    this.cl.on('error', function(err) {
+        clearTimeout(tmout);
+        finish(err);
+    });
+    this.cl.on('end', function() {
+        clearTimeout(tmout);
+        finish(new Error('redis connection destroyed'));
     });
     var bufbytes = new Buffer(0);
     var bufelements = [];
@@ -65,15 +80,6 @@ connect.prototype._connect_redis = function(host, port) {
             if(el[0] == 'e') cb(el[1]);
             else cb(null, el[1]);
         };
-    });
-    this.cl.on('end', function() {
-        self.connected = false;
-        self.ended = true;
-        while(self._callbacks.length) {
-            var cb = self._callbacks.shift().cb;
-            if(cb) cb(new Error('redis connection destroyed'));
-        }
-        self.emit('end');
     });
 }
 
@@ -100,7 +106,6 @@ connect.prototype._connect_sentinel = function() {
     }, 5000);
     cl = net.connect(port, host,
         function() { //'connect' listener
-            clearTimeout(tmout);
             cl.write(serialize(['sentinel', 'get-master-addr-by-name', 
                     self._master]));
         }
@@ -119,6 +124,7 @@ connect.prototype._connect_sentinel = function() {
         bufbytes = Buffer.concat([bufbytes, data]);
         parse_elements(bufelements, bufbytes);
         if(has_one_complete_element(bufelements)) {
+            clearTimeout(tmout);
             cl.destroy();
             var el = get_complete_element(bufelements, false);
             if(!Array.isArray(el[1])) {
