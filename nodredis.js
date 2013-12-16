@@ -71,7 +71,7 @@ connect.prototype._connect_redis = function(host, port) {
     var bufelements = [];
     this.cl.on('data', function(data) {
         bufbytes = Buffer.concat([bufbytes, data]);
-        parse_elements(bufelements, bufbytes);
+        bufbytes = parse_elements(bufelements, bufbytes);
         while(has_one_complete_element(bufelements)) {
             var dadcb = self._callbacks.shift();
             var cb = dadcb && dadcb.cb;
@@ -122,7 +122,7 @@ connect.prototype._connect_sentinel = function() {
     var bufelements = [];
     cl.on('data', function(data) {
         bufbytes = Buffer.concat([bufbytes, data]);
-        parse_elements(bufelements, bufbytes);
+        bufbytes = parse_elements(bufelements, bufbytes);
         if(has_one_complete_element(bufelements)) {
             clearTimeout(tmout);
             cl.destroy();
@@ -192,6 +192,7 @@ function parse_elements(bufelems, bufbytes) {
         bufelems.push(elb[0]);
         bufbytes = elb[1];
     }
+    return bufbytes;
 }
 
 function has_one_complete_element(bufelements) {
