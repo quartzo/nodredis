@@ -67,6 +67,9 @@ connect.prototype._connect_redis = function(host, port) {
         clearTimeout(tmout);
         finish(new Error('redis connection destroyed'));
     });
+    this.cl.on('slave', function() {
+        finish(new Error('redis turned slave'));
+    });
     var bufbytes = new Buffer(0);
     var bufelements = [];
     this.cl.on('data', function(data) {
@@ -260,10 +263,16 @@ connect.prototype.req_cmd = function(params, cb, binaryresp) {
 connect.prototype._keep_alive = function() {
     var self = this;
     if((!this.connected) || this.ended) return;
-    this.req_cmd(['ping'], null, false);
+    if(!this._master) {
+        self.req_cmd(['ping'], null, false);
+    } else {
+        self.req_cmd(['config','get','slaveof'], function (err, res) {
+            if(err || res[1]) self.cl.emit('slave');
+        }, false);
+    }
     setTimeout(function () {
         self._keep_alive();
-    }, 180000);
+    }, 30000);
 }
 
 connect.prototype.cmd = function() {

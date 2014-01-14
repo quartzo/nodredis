@@ -1,6 +1,6 @@
 {
   "name": "nodredis",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "description": "A really simple Redis Client for Node.js",
   "main": "nodredis.js",
   "scripts": {
